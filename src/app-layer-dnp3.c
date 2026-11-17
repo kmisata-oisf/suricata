@@ -23,13 +23,10 @@
 
 #include "suricata-common.h"
 #include "suricata.h"
-#include "util-unittest.h"
 
-#include "util-byte.h"
 #include "util-spm-bs.h"
 #include "util-enum.h"
 
-#include "app-layer.h"
 #include "app-layer-protos.h"
 #include "app-layer-parser.h"
 #include "app-layer-detect-proto.h"
@@ -37,6 +34,10 @@
 
 #include "app-layer-dnp3.h"
 #include "app-layer-dnp3-objects.h"
+#include "conf.h"
+#include "rust.h"
+#include "util-debug.h"
+#include "util-validate.h"
 
 #define DNP3_DEFAULT_PORT "20000"
 
@@ -683,8 +684,8 @@ static void DNP3BufferTrim(DNP3Buffer *buffer)
         DNP3BufferReset(buffer);
     }
     else if (buffer->offset > 0) {
-        memmove(buffer->buffer, buffer->buffer + buffer->offset,
-            buffer->len - buffer->offset);
+        SCMemmove(buffer->buffer, buffer->size, buffer->buffer + buffer->offset,
+                buffer->len - buffer->offset);
         buffer->len = buffer->len - buffer->offset;
         buffer->offset = 0;
     }
@@ -1694,6 +1695,7 @@ void RegisterDNP3Parsers(void)
 
 #include "flow-util.h"
 #include "stream-tcp.h"
+#include "threads.h"
 
 /**
  * \brief Utility function to fix CRCs when mangling a frame.

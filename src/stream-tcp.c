@@ -45,7 +45,6 @@
 #include "util-pool.h"
 #include "util-pool-thread.h"
 #include "util-checksum.h"
-#include "util-unittest.h"
 #include "util-print.h"
 #include "util-debug.h"
 #include "util-device-private.h"
@@ -75,7 +74,6 @@
 #include "util-runmodes.h"
 #include "util-random.h"
 #include "util-exception-policy.h"
-#include "util-time.h"
 
 #include "source-pcap-file.h"
 #include "action-globals.h"
@@ -652,7 +650,7 @@ void StreamTcpInitConfig(bool quiet)
             FatalError("stream.reassembly.urgent.policy: invalid value '%s'", temp_urgpol);
         }
     } else {
-        stream_config.urgent_policy = TCP_STREAM_URGENT_DEFAULT;
+        stream_config.urgent_policy = TCP_STREAM_URGENT_OOB;
     }
     if (!quiet) {
         SCLogConfig("stream.reassembly.urgent.policy\": %s", UrgentPolicyToString(stream_config.urgent_policy));
@@ -671,7 +669,7 @@ void StreamTcpInitConfig(bool quiet)
                 FatalError("stream.reassembly.urgent.oob-limit-policy: invalid value '%s'", temp_urgoobpol);
             }
         } else {
-            stream_config.urgent_oob_limit_policy = TCP_STREAM_URGENT_DEFAULT;
+            stream_config.urgent_oob_limit_policy = TCP_STREAM_URGENT_DROP;
         }
         if (!quiet) {
             SCLogConfig("stream.reassembly.urgent.oob-limit-policy\": %s", UrgentPolicyToString(stream_config.urgent_oob_limit_policy));
@@ -1059,6 +1057,30 @@ void StreamTcpSetOSPolicy(TcpStream *stream, Packet *p)
 }
 
 /**
+ *  \brief check if the reassembly base of a stream can still bound an ACK
+ *
+ *  The base_seq of a direction is the sequence number of the first byte the
+ *  reassembly buffer holds, and it only moves when StreamTcpPruneSession()
+ *  slides that buffer. A direction that is done reassembling (reassembly depth
+ *  reached, or app-layer and raw both finished) never slides again, so its
+ *  base_seq stays behind while the sequence numbers of the stream keep
+ *  advancing. Since SEQ_GT() only compares within half the sequence space, such
+ *  a stale anchor reads as "ahead of the ACK" once 2^31 bytes went by, which
+ *  would freeze last_ack (and with it next_win) until the sequence space came
+ *  all the way round again 2^32 bytes later. Nothing is inserted in that
+ *  direction anymore, so the bound has nothing to protect there.
+ *
+ *  \param stream stream to check
+ *  \retval true base_seq still tracks the stream, so it can bound an ACK
+ *  \retval false base_seq went stale, do not bound the ACK with it
+ */
+static inline bool StreamTcpBaseSeqBoundsAck(const TcpStream *stream)
+{
+    return (stream->flags &
+                   (STREAMTCP_STREAM_FLAG_NOREASSEMBLY | STREAMTCP_STREAM_FLAG_DEPTH_REACHED)) == 0;
+}
+
+/**
  *  \brief macro to update last_ack only if the new value is higher
  *
  *  \param ssn session
@@ -1067,7 +1089,8 @@ void StreamTcpSetOSPolicy(TcpStream *stream, Packet *p)
  */
 #define StreamTcpUpdateLastAck(ssn, stream, ack)                                                   \
     {                                                                                              \
-        if (SEQ_GT((ack), (stream)->last_ack) && SEQ_GT(ack, (stream)->base_seq)) {                \
+        if (SEQ_GT((ack), (stream)->last_ack) &&                                                   \
+                (!StreamTcpBaseSeqBoundsAck(stream) || SEQ_GT(ack, (stream)->base_seq))) {         \
             SCLogDebug("ssn %p: last_ack set to %" PRIu32 ", moved %u forward", (ssn), (ack),      \
                     (ack) - (stream)->last_ack);                                                   \
             if ((SEQ_LEQ((stream)->last_ack, (stream)->next_seq) &&                                \
@@ -6550,19 +6573,16 @@ static int StreamTcpValidateTimestamp (TcpSession *ssn, Packet *p)
         }
 
         if (check_ts) {
-            int32_t result = 0;
-
-            SCLogDebug("ts %"PRIu32", last_ts %"PRIu32"", ts, last_ts);
-
+            /* Linux, and every policy when stream.liberal-timestamps is enabled (the
+             * default), accepts a TSval one tick behind the stream timestamp. */
+            uint32_t tolerance = 0;
             if (receiver_stream->os_policy == OS_POLICY_LINUX || stream_config.liberal_timestamps) {
-                /* Linux accepts TS which are off by one.*/
-                result = (int32_t) ((ts - last_ts) + 1);
-            } else {
-                result = (int32_t) (ts - last_ts);
+                tolerance = 1;
             }
 
-            SCLogDebug("result %" PRIi32 ", p->ts(secs) %" PRIuMAX "", result,
-                    (uintmax_t)SCTIME_SECS(p->ts));
+            SCLogDebug("ts %" PRIu32 ", last_ts %" PRIu32 ", tolerance %" PRIu32
+                       ", p->ts(secs) %" PRIuMAX "",
+                    ts, last_ts, tolerance, (uintmax_t)SCTIME_SECS(p->ts));
 
             if (last_pkt_ts == 0 &&
                     (ssn->flags & STREAMTCP_FLAG_MIDSTREAM))
@@ -6570,10 +6590,10 @@ static int StreamTcpValidateTimestamp (TcpSession *ssn, Packet *p)
                 last_pkt_ts = (uint32_t)SCTIME_SECS(p->ts);
             }
 
-            if (result < 0) {
+            if (TS_LT(ts, last_ts - tolerance)) {
                 SCLogDebug("timestamp is not valid last_ts "
-                           "%" PRIu32 " p->tcpvars->ts %" PRIu32 " result "
-                           "%" PRId32 "", last_ts, ts, result);
+                           "%" PRIu32 " p->tcpvars->ts %" PRIu32 "",
+                        last_ts, ts);
                 /* candidate for rejection */
                 ret = 0;
             } else if ((sender_stream->last_ts != 0) &&
@@ -6694,19 +6714,16 @@ static int StreamTcpHandleTimestamp (TcpSession *ssn, Packet *p)
         }
 
         if (check_ts) {
-            int32_t result = 0;
-
-            SCLogDebug("ts %"PRIu32", last_ts %"PRIu32"", ts, sender_stream->last_ts);
-
+            /* Linux, and every policy when stream.liberal-timestamps is enabled (the
+             * default), accepts a TSval one tick behind the stream timestamp. */
+            uint32_t tolerance = 0;
             if (receiver_stream->os_policy == OS_POLICY_LINUX || stream_config.liberal_timestamps) {
-                /* Linux accepts TS which are off by one.*/
-                result = (int32_t) ((ts - sender_stream->last_ts) + 1);
-            } else {
-                result = (int32_t) (ts - sender_stream->last_ts);
+                tolerance = 1;
             }
 
-            SCLogDebug("result %" PRIi32 ", p->ts(sec) %" PRIuMAX "", result,
-                    (uintmax_t)SCTIME_SECS(p->ts));
+            SCLogDebug("ts %" PRIu32 ", last_ts %" PRIu32 ", tolerance %" PRIu32
+                       ", p->ts(sec) %" PRIuMAX "",
+                    ts, sender_stream->last_ts, tolerance, (uintmax_t)SCTIME_SECS(p->ts));
 
             if (sender_stream->last_pkt_ts == 0 &&
                     (ssn->flags & STREAMTCP_FLAG_MIDSTREAM))
@@ -6714,10 +6731,10 @@ static int StreamTcpHandleTimestamp (TcpSession *ssn, Packet *p)
                 sender_stream->last_pkt_ts = (uint32_t)SCTIME_SECS(p->ts);
             }
 
-            if (result < 0) {
+            if (TS_LT(ts, sender_stream->last_ts - tolerance)) {
                 SCLogDebug("timestamp is not valid sender_stream->last_ts "
-                           "%" PRIu32 " p->tcpvars->ts %" PRIu32 " result "
-                           "%" PRId32 "", sender_stream->last_ts, ts, result);
+                           "%" PRIu32 " p->tcpvars->ts %" PRIu32 "",
+                        sender_stream->last_ts, ts);
                 /* candidate for rejection */
                 ret = 0;
             } else if ((sender_stream->last_ts != 0) &&
@@ -6731,10 +6748,17 @@ static int StreamTcpHandleTimestamp (TcpSession *ssn, Packet *p)
             }
 
             if (ret == 1) {
-                /* Update the timestamp and last seen packet time for this
-                 * stream */
-                if (SEQ_EQ(sender_stream->next_seq, seq))
+                /* RFC 7323, section 5.3, rule R3: an acceptable segment at or before the
+                 * last acknowledged sequence with a timestamp at or after the stream
+                 * timestamp (TS.Recent) updates it. Acceptability also requires the
+                 * segment to reach the last acknowledged sequence (end_seq >= last_ack).
+                 * Like Linux, skip the update when the ACK goes backwards. */
+                if (SEQ_LEQ(seq, sender_stream->last_ack) && TS_GEQ(ts, sender_stream->last_ts) &&
+                        SEQ_GEQ(seq + p->payload_len, sender_stream->last_ack) &&
+                        (tcph->th_flags & TH_ACK) &&
+                        SEQ_GEQ(TCP_GET_RAW_ACK(tcph), receiver_stream->last_ack)) {
                     sender_stream->last_ts = ts;
+                }
 
                 sender_stream->last_pkt_ts = (uint32_t)SCTIME_SECS(p->ts);
 
@@ -6935,6 +6959,7 @@ static void StreamTcpPseudoPacketCreateDetectLogFlush(ThreadVars *tv,
     memcpy(&np->vlan_id[0], &f->vlan_id[0], sizeof(np->vlan_id));
     np->vlan_idx = f->vlan_idx;
     np->livedev_id = f->livedev_id;
+    np->tunnel_id = f->tunnel_id;
 
     if (parent->flags & PKT_NOPACKET_INSPECTION) {
         DecodeSetNoPacketInspectionFlag(np);

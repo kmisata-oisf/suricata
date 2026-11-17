@@ -44,7 +44,6 @@
 #include "runmode-pcap-file.h"
 #include "runmode-unix-socket.h"
 #include "runmode-windivert.h"
-#include "util-unittest.h"
 #include "util-misc.h"
 #include "util-plugin.h"
 
@@ -534,7 +533,6 @@ static void RunOutputFreeList(void)
     }
 }
 
-static int file_logger_count = 0;
 static int filedata_logger_count = 0;
 
 int RunModeOutputFiledataEnabled(void)
@@ -588,7 +586,6 @@ void RunModeShutDown(void)
     OutputClearActiveLoggers();
 
     /* Reset logger counts. */
-    file_logger_count = 0;
     filedata_logger_count = 0;
 }
 
@@ -656,7 +653,6 @@ static void SetupOutput(
         SCLogDebug("%s is a file logger", module->name);
         SCOutputRegisterFileLogger(module->logger_id, module->name, module->FileLogFunc, output_ctx,
                 module->ThreadInit, module->ThreadDeinit);
-        file_logger_count++;
     } else if (module->StreamingLogFunc) {
         SCLogDebug("%s is a streaming logger", module->name);
         SCOutputRegisterStreamingLogger(module->logger_id, module->name, module->StreamingLogFunc,

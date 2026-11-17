@@ -42,13 +42,13 @@
 #include "detect-isdataat.h"
 #include "detect-flow.h"
 #include "detect-ttl.h"
+#include "detect-threshold.h"
 #include "detect-tcp-flags.h"
 #include "detect-tcp-ack.h"
 #include "detect-ipopts.h"
 #include "detect-tcp-seq.h"
 #include "feature.h"
 #include "util-print.h"
-#include "util-time.h"
 #include "util-validate.h"
 #include "util-conf.h"
 #include "detect-flowbits.h"
@@ -1517,6 +1517,21 @@ void EngineAnalysisRules2(const DetectEngineCtx *de_ctx, const Signature *s)
     }
     SCJbClose(ctx.js);
 
+    if (s->type == SIG_TYPE_IPONLY && s->sm_arrays[DETECT_SM_LIST_THRESHOLD] != NULL) {
+        const SigMatchData *smd = s->sm_arrays[DETECT_SM_LIST_THRESHOLD];
+        while (1) {
+            if ((smd->type == DETECT_THRESHOLD || smd->type == DETECT_DETECTION_FILTER) &&
+                    ((const DetectThresholdData *)smd->ctx)->track == TRACK_FLOW) {
+                AnalyzerWarning(&ctx, (char *)"threshold by_flow with an IP Only rule "
+                                              "is ineffective for higher counts");
+                break;
+            }
+            if (smd->is_last)
+                break;
+            smd++;
+        }
+    }
+
     if (pkt_mpm || app_mpm) {
         SCJbOpenObject(ctx.js, "mpm");
 
@@ -1784,6 +1799,7 @@ void EngineAnalysisRules(const DetectEngineCtx *de_ctx,
     uint32_t warn_non_alproto_fp_for_alproto_sig = 0;
     uint32_t warn_no_direction = 0;
     uint32_t warn_both_direction = 0;
+    uint32_t warn_threshold_by_flow_iponly = 0;
 
     EngineAnalysisItemsInit(de_ctx->ea);
 
@@ -1873,6 +1889,13 @@ void EngineAnalysisRules(const DetectEngineCtx *de_ctx,
             else if (sm->type == DETECT_FLAGS) {
                 if (sm->ctx != NULL) {
                     rule_flags = 1;
+                }
+            }
+            if (sm->type == DETECT_THRESHOLD || sm->type == DETECT_DETECTION_FILTER) {
+                if ((s->type == SIG_TYPE_IPONLY) &&
+                        ((DetectThresholdData *)sm->ctx)->track == TRACK_FLOW) {
+                    warn_threshold_by_flow_iponly = 1;
+                    rule_warning += 1;
                 }
             }
         } /* for (sm = s->init_data->smlists[list_id]; sm != NULL; sm = sm->next) */
@@ -2139,6 +2162,10 @@ void EngineAnalysisRules(const DetectEngineCtx *de_ctx,
         if (warn_file_store_not_present) {
             fprintf(fp, "    Warning: Rule requires file-store but the output file-store is not "
                         "enabled.\n");
+        }
+        if (warn_threshold_by_flow_iponly) {
+            fprintf(fp, "    Warning: Rule uses threshold by_flow with an IP Only rule which "
+                        "is ineffective for higher counts.\n");
         }
         if (rule_warning == 0) {
             fprintf(fp, "    No warnings for this rule.\n");

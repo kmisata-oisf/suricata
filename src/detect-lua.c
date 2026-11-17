@@ -43,7 +43,6 @@
 
 #include "util-byte.h"
 
-#include "util-unittest.h"
 #include "util-unittest-helper.h"
 
 #include "app-layer.h"
@@ -95,13 +94,13 @@ void DetectLuaRegister(void)
 
     g_lua_ja3_list_id = DetectBufferTypeRegister("ja3.lua");
     DetectAppLayerInspectEngineRegister("ja3.lua", ALPROTO_TLS, SIG_FLAG_TOSERVER,
-            TLS_STATE_CLIENT_HELLO_DONE, DetectEngineInspectGenericList, NULL);
+            TLS_STATE_CLIENT_HELLO, DetectEngineInspectGenericList, NULL);
     DetectAppLayerInspectEngineRegister(
             "ja3.lua", ALPROTO_QUIC, SIG_FLAG_TOSERVER, 1, DetectEngineInspectGenericList, NULL);
 
     g_lua_ja3s_list_id = DetectBufferTypeRegister("ja3s.lua");
     DetectAppLayerInspectEngineRegister("ja3s.lua", ALPROTO_TLS, SIG_FLAG_TOCLIENT,
-            TLS_STATE_SERVER_HELLO_DONE, DetectEngineInspectGenericList, NULL);
+            TLS_STATE_SERVER_DATA, DetectEngineInspectGenericList, NULL);
     DetectAppLayerInspectEngineRegister(
             "ja3s.lua", ALPROTO_QUIC, SIG_FLAG_TOCLIENT, 1, DetectEngineInspectGenericList, NULL);
 
@@ -154,13 +153,6 @@ void LuaDumpStack(lua_State *state, const char *prefix)
         }
         printf("\n");
     }
-}
-
-static void LuaStateSetDetectLuaData(lua_State *state, DetectLuaData *data)
-{
-    lua_pushlightuserdata(state, (void *)&luaext_key_ld);
-    lua_pushlightuserdata(state, (void *)data);
-    lua_settable(state, LUA_REGISTRYINDEX);
 }
 
 /**
@@ -322,8 +314,6 @@ static int DetectLuaMatch (DetectEngineThreadCtx *det_ctx,
      * use. */
     const uint64_t cfg_limit = SCLuaSbResetBytesLimit(tlua->luastate);
 
-    LuaStateSetThreadVars(tlua->luastate, det_ctx->tv);
-
     LuaExtensionsMatchSetup(tlua->luastate, lua, det_ctx, p->flow, p, s, flags);
 
     lua_getglobal(tlua->luastate, "match");
@@ -415,6 +405,12 @@ static void *DetectLuaThreadInit(void *data, bool allow_restricted_functions)
         goto error;
     }
 
+    /* the sandbox context owns this state's invocation counter */
+    SCLuaSbState *sb = SCLuaSbGetContext(t->luastate);
+    if (sb != NULL) {
+        LuaStateSetInvocationGen(t->luastate, &sb->invocation_gen);
+    }
+
     if (allow_restricted_functions) {
         luaL_openlibs(t->luastate);
         SCLuaRequirefBuiltIns(t->luastate);
@@ -443,6 +439,9 @@ static void *DetectLuaThreadInit(void *data, bool allow_restricted_functions)
     }
 #endif
 
+    /* setup calls get a fresh instruction budget so a low max-instructions
+     * bounds per-packet work, not rule load or engine start */
+    SCLuaSbResetInstructionCounter(t->luastate);
     /* prime the script (or something) */
     if (lua_pcall(t->luastate, 0, 0, 0) != 0) {
         SCLogError("couldn't prime file: %s", lua_tostring(t->luastate, -1));
@@ -452,6 +451,7 @@ static void *DetectLuaThreadInit(void *data, bool allow_restricted_functions)
     /* thread_init call */
     lua_getglobal(t->luastate, "thread_init");
     if (lua_isfunction(t->luastate, -1)) {
+        SCLuaSbResetInstructionCounter(t->luastate);
         if (lua_pcall(t->luastate, 0, 0, 0) != 0) {
             SCLogError("couldn't run script 'thread_init' function: %s",
                     lua_tostring(t->luastate, -1));
@@ -484,8 +484,24 @@ static void DetectLuaThreadFree(void *ctx)
 {
     if (ctx != NULL) {
         DetectLuaThreadData *t = (DetectLuaThreadData *)ctx;
-        if (t->luastate != NULL)
+        if (t->luastate != NULL) {
+            /* finalizers run while the state closes: the context slots and
+             * the invocation generation still name the last call's objects,
+             * which the engine may have freed by now (a tx can be evicted
+             * while its flow stays live, and the packet pool goes first)
+             * - clear them so a cursor or handle read from a finalizer
+             * fails closed (the cold path re-resolves and yields nil) */
+            LuaStateSetPacket(t->luastate, NULL);
+            LuaStateSetPacketAlert(t->luastate, NULL);
+            LuaStateSetTX(t->luastate, NULL, 0);
+            LuaStateSetFlow(t->luastate, NULL);
+            LuaStateSetFile(t->luastate, NULL);
+            LuaStateSetSignature(t->luastate, NULL);
+            LuaStateSetDetCtx(t->luastate, NULL);
+            LuaStateSetDetectLuaData(t->luastate, NULL);
+            LuaStateSetInvocationGen(t->luastate, NULL);
             SCLuaSbStateClose(t->luastate);
+        }
         SCFree(t);
     }
 }
@@ -531,6 +547,10 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
 {
     int status;
 
+    /* the signature passed to init(): bytevar.map() must accept exactly
+     * this pointer */
+    ld->signature = s;
+
     lua_State *luastate = SCLuaSbStateNew(ld->alloc_limit, ld->instruction_limit);
     if (luastate == NULL)
         return -1;
@@ -561,6 +581,9 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
     }
 #endif
 
+    /* setup calls get a fresh instruction budget so a low max-instructions
+     * bounds per-packet work, not rule load */
+    SCLuaSbResetInstructionCounter(luastate);
     /* prime the script (or something) */
     if (lua_pcall(luastate, 0, 0, 0) != 0) {
         SCLogError("couldn't prime file: %s", lua_tostring(luastate, -1));
@@ -577,10 +600,14 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
      * access to the signature. */
     lua_pushlightuserdata(luastate, (void *)s);
 
+    ld->register_in_init = true;
+    SCLuaSbResetInstructionCounter(luastate);
     if (lua_pcall(luastate, 1, 1, 0) != 0) {
         SCLogError("couldn't run script 'init' function: %s", lua_tostring(luastate, -1));
+        ld->register_in_init = false;
         goto error;
     }
+    ld->register_in_init = false;
 
     /* process returns from script */
     if (lua_gettop(luastate) == 0) {
@@ -595,9 +622,14 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
     lua_pushnil(luastate);
     const char *k;
     while (lua_next(luastate, -2)) {
-        k = lua_tostring(luastate, -2);
-        if (k == NULL)
+        /* only string keys name an option. lua_tostring() on a number
+         * key converts it in place and the next lua_next() then raises
+         * "invalid key to 'next'" outside any pcall (abort) */
+        if (lua_type(luastate, -2) != LUA_TSTRING) {
+            lua_pop(luastate, 1);
             continue;
+        }
+        k = lua_tostring(luastate, -2);
 
         /* handle flowvar and bytes separately as they have a table as value */
         if (strcmp(k, "flowvar") == 0) {
@@ -728,6 +760,14 @@ static int DetectLuaSetup (DetectEngineCtx *de_ctx, Signature *s, const char *st
     intmax_t lua_instruction_limit = DEFAULT_LUA_INSTRUCTION_LIMIT;
     (void)SCConfGetInt("security.lua.max-bytes", &lua_alloc_limit);
     (void)SCConfGetInt("security.lua.max-instructions", &lua_instruction_limit);
+    /* a negative value would wrap the cap below the baseline and fail
+     * every call silently; 0 means unlimited */
+    if (lua_alloc_limit < 0) {
+        SCLogError("security.lua.max-bytes must be non-negative (got %" PRIdMAX "), "
+                   "use 0 for no limit",
+                lua_alloc_limit);
+        goto error;
+    }
     lua->alloc_limit = lua_alloc_limit;
     lua->instruction_limit = lua_instruction_limit;
 

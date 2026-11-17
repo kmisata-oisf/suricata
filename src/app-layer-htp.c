@@ -36,23 +36,17 @@
 #include "suricata.h"
 #include "suricata-common.h"
 #include "conf.h"
-#include "decode.h"
 
-#include "util-print.h"
 #include "util-byte.h"
-
-#include "stream-tcp.h"
 
 #include "app-layer-protos.h"
 #include "app-layer-parser.h"
 
-#include "app-layer.h"
 #include "app-layer-detect-proto.h"
 #include "app-layer-frames.h"
 #include "app-layer-htp.h"
 #include "app-layer-htp-body.h"
 #include "app-layer-htp-file.h"
-#include "app-layer-htp-xff.h"
 #include "app-layer-htp-range.h"
 #include "app-layer-htp-mem.h"
 #include "app-layer-events.h"
@@ -61,18 +55,18 @@
 #include "util-file-decompression.h"
 #include "util-misc.h"
 
-#include "util-unittest.h"
-#include "util-unittest-helper.h"
-#include "flow-util.h"
 
-#include "detect-engine.h"
-#include "detect-engine-build.h"
 #include "detect-engine-state.h"
-#include "detect-parse.h"
 
 #include "util-memcmp.h"
 #include "util-random.h"
 #include "util-validate.h"
+#include "flow.h"
+#include "rust.h"
+#include "stream-tcp-reassemble.h"
+#include "util-enum.h"
+#include "util-radix4-tree.h"
+#include "util-radix6-tree.h"
 
 //#define PRINT
 
@@ -1823,7 +1817,7 @@ static int HTPCallbackResponseComplete(const htp_connp_t *connp, htp_tx_t *tx)
         /* any 2XX status response implies that the connection will become
            a tunnel immediately after this packet (RFC 7230, 3.3.3). */
         if ((htp_tx_response_status_number(tx) >= 200) &&
-                (htp_tx_response_status_number(tx) < 300) && (hstate->transaction_cnt == 1)) {
+                (htp_tx_response_status_number(tx) < 300)) {
             uint16_t dp = 0;
             if (htp_tx_request_port_number(tx) != -1) {
                 dp = (uint16_t)htp_tx_request_port_number(tx);
@@ -2697,6 +2691,15 @@ void RegisterHTPParsers(void)
 
 #ifdef UNITTESTS
 #include "detect-engine-alert.h"
+#include "app-layer-htp-xff.h"
+#include "counters.h"
+#include "detect-engine.h"
+#include "detect-engine-build.h"
+#include "detect-parse.h"
+#include "flow-util.h"
+#include "stream-tcp.h"
+#include "util-print.h"
+#include "util-unittest-helper.h"
 
 static HTPCfgRec cfglist_backup;
 
@@ -5733,7 +5736,6 @@ static void HTPParserRegisterTests(void)
     UtRegisterTest("HTPParserTest27", HTPParserTest27);
 
     HTPFileParserRegisterTests();
-    HTPXFFParserRegisterTests();
 }
 #endif /* UNITTESTS */
 

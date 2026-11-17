@@ -34,17 +34,23 @@
 
 #include "datasets.h"
 
+/*
+ * The handle stores a copy of the set name, not a Dataset* pointer.
+ * The engine frees and re-creates sets on rule reload
+ * (DatasetPostReloadCleanup) while output states keep running; a cached
+ * pointer would dangle. Re-resolving the name on every use follows the
+ * reload to the new set and fails cleanly if the set is gone.
+ */
 struct LuaDataset {
-    Dataset *set;
+    char name[DATASET_NAME_MAX_LEN + 1];
 };
 
 static int LuaDatasetGC(lua_State *luastate)
 {
     SCLogDebug("gc:start");
-    struct LuaDataset *s = (struct LuaDataset *)luaL_testudata(luastate, 1, "dataset::metatable");
-    if (s != NULL && s->set != NULL) {
-        SCLogDebug("deref %s", s->set->name);
-        s->set = NULL;
+    struct LuaDataset *s = SCLuaTestUserData(luastate, 1, "dataset::metatable", SCLUA_TUD_DATASET);
+    if (s != NULL) {
+        s->name[0] = '\0';
     }
     SCLogDebug("gc:done");
     return 0;
@@ -53,27 +59,36 @@ static int LuaDatasetGC(lua_State *luastate)
 static int LuaDatasetGetRef(lua_State *luastate)
 {
     SCLogDebug("get");
-    struct LuaDataset *s = (struct LuaDataset *)luaL_checkudata(luastate, 1, "dataset::metatable");
+    struct LuaDataset *s = SCLuaCheckUserData(luastate, 1, "dataset::metatable", SCLUA_TUD_DATASET);
 
     const char *name = lua_tostring(luastate, 2);
     if (name == NULL) {
         LUA_ERROR("null string");
     }
 
-    Dataset *dataset = DatasetFind(name, DATASET_TYPE_STRING);
-    if (dataset == NULL) {
+    if (DatasetFind(name, DATASET_TYPE_STRING) == NULL) {
         LUA_ERROR("dataset not found");
     }
-    s->set = dataset;
+    if (strlen(name) >= sizeof(s->name)) {
+        LUA_ERROR("dataset name too long");
+    }
+    snprintf(s->name, sizeof(s->name), "%s", name);
     return 0;
 }
 
 static int LuaDatasetAdd(lua_State *luastate)
 {
     SCLogDebug("add:start");
-    struct LuaDataset *s = luaL_checkudata(luastate, 1, "dataset::metatable");
-    if (s->set == NULL) {
+    struct LuaDataset *s = SCLuaCheckUserData(luastate, 1, "dataset::metatable", SCLUA_TUD_DATASET);
+    if (s->name[0] == '\0') {
         LUA_ERROR("dataset is not initialized (call :get first)");
+    }
+
+    /* re-resolve the set: the cached name is the only engine state we
+     * hold, so a set freed and reloaded under the same name is followed */
+    Dataset *dataset = DatasetFind(s->name, DATASET_TYPE_STRING);
+    if (dataset == NULL) {
+        LUA_ERROR("dataset not found");
     }
 
     size_t real_len = 0;
@@ -91,7 +106,7 @@ static int LuaDatasetAdd(lua_State *luastate)
     }
     uint32_t str_len = (uint32_t)n;
 
-    int r = SCDatasetAdd(s->set, str, str_len);
+    int r = SCDatasetAdd(dataset, str, str_len);
     /* return value through luastate, as a luanumber */
     lua_pushnumber(luastate, (lua_Number)r);
     SCLogDebug("add:end");
@@ -101,7 +116,7 @@ static int LuaDatasetAdd(lua_State *luastate)
 static int LuaDatasetNew(lua_State *luastate)
 {
     SCLogDebug("new:start");
-    struct LuaDataset *s = (struct LuaDataset *)lua_newuserdata(luastate, sizeof(*s));
+    struct LuaDataset *s = SCLuaNewUserData(luastate, SCLUA_TUD_DATASET, sizeof(*s));
     if (s == NULL) {
         LUA_ERROR("failed to get userdata");
     }

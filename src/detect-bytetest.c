@@ -41,7 +41,6 @@
 #include "app-layer.h"
 
 #include "util-byte.h"
-#include "util-unittest.h"
 #include "util-debug.h"
 #include "detect-pcre.h"
 
@@ -466,7 +465,7 @@ static DetectBytetestData *DetectBytetestParse(
         end_ptr = (char *)str_ptr;
         while (!(isspace((unsigned char)*end_ptr) || (*end_ptr == ',')) && (*end_ptr != '\0'))
             end_ptr++;
-        memmove(data_offset, str_ptr, end_ptr - str_ptr);
+        SCMemmove(data_offset, strlen(data_offset) + 1, str_ptr, end_ptr - str_ptr);
         data_offset[end_ptr-str_ptr] = '\0';
         if (data_offset[0] != '-' && isalpha((unsigned char)data_offset[0])) {
             *offset = SCStrdup(data_offset);

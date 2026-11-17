@@ -743,6 +743,10 @@ pub struct SMBState {
     /// transactions list
     pub transactions: VecDeque<SMBTransaction>,
 
+    /// file txs held in the transactions list: the OOO backstop scan is a
+    /// no-op without one, so it is skipped when this is 0
+    pub(crate) file_tx_count: u32,
+
     /// tx counter for assigning incrementing id's to tx's
     tx_id: u64,
 
@@ -814,6 +818,7 @@ impl SMBState {
             check_post_gap_file_txs: false,
             post_gap_files_checked: false,
             transactions: VecDeque::new(),
+            file_tx_count: 0,
             tx_id: 0,
             dialect: 0,
             dialect_vec: None,
@@ -863,6 +868,12 @@ impl SMBState {
             }
         }
         if found {
+            if matches!(
+                self.transactions[index].type_data,
+                Some(SMBTransactionTypeData::FILE(_))
+            ) {
+                self.file_tx_count = self.file_tx_count.saturating_sub(1);
+            }
             SCLogDebug!(
                 "freeing TX with ID {} TX.ID {} at index {} left: {} max id: {}",
                 tx_id,
@@ -2918,9 +2929,14 @@ pub unsafe extern "C" fn SCRegisterSmbParser() {
         let retval = conf_get("app-layer.protocols.smb.max-read-size");
         if let Some(val) = retval {
             match get_memval(val) {
-                Ok(retval) => {
-                    SMB_CFG_MAX_READ_SIZE = retval as u32;
-                }
+                Ok(retval) => match u32::try_from(retval) {
+                    Ok(v) => {
+                        SMB_CFG_MAX_READ_SIZE = v;
+                    }
+                    Err(_) => {
+                        SCLogError!("value out of range for smb.max-read-size");
+                    }
+                },
                 Err(_) => {
                     SCLogError!("Invalid max-read-size value");
                 }
@@ -2929,9 +2945,14 @@ pub unsafe extern "C" fn SCRegisterSmbParser() {
         let retval = conf_get("app-layer.protocols.smb.max-write-size");
         if let Some(val) = retval {
             match get_memval(val) {
-                Ok(retval) => {
-                    SMB_CFG_MAX_WRITE_SIZE = retval as u32;
-                }
+                Ok(retval) => match u32::try_from(retval) {
+                    Ok(v) => {
+                        SMB_CFG_MAX_WRITE_SIZE = v;
+                    }
+                    Err(_) => {
+                        SCLogError!("value out of range for smb.max-write-size");
+                    }
+                },
                 Err(_) => {
                     SCLogError!("Invalid max-write-size value");
                 }
@@ -2940,9 +2961,14 @@ pub unsafe extern "C" fn SCRegisterSmbParser() {
         let retval = conf_get("app-layer.protocols.smb.max-write-queue-size");
         if let Some(val) = retval {
             match get_memval(val) {
-                Ok(retval) => {
-                    SMB_CFG_MAX_WRITE_QUEUE_SIZE = retval as u32;
-                }
+                Ok(retval) => match u32::try_from(retval) {
+                    Ok(v) => {
+                        SMB_CFG_MAX_WRITE_QUEUE_SIZE = v;
+                    }
+                    Err(_) => {
+                        SCLogError!("value out of range for smb.max-write-queue-size");
+                    }
+                },
                 Err(_) => {
                     SCLogError!("Invalid max-write-queue-size value");
                 }
@@ -2951,9 +2977,14 @@ pub unsafe extern "C" fn SCRegisterSmbParser() {
         let retval = conf_get("app-layer.protocols.smb.max-write-queue-cnt");
         if let Some(val) = retval {
             match get_memval(val) {
-                Ok(retval) => {
-                    SMB_CFG_MAX_WRITE_QUEUE_CNT = retval as u32;
-                }
+                Ok(retval) => match u32::try_from(retval) {
+                    Ok(v) => {
+                        SMB_CFG_MAX_WRITE_QUEUE_CNT = v;
+                    }
+                    Err(_) => {
+                        SCLogError!("value out of range for smb.max-write-queue-cnt");
+                    }
+                },
                 Err(_) => {
                     SCLogError!("Invalid max-write-queue-cnt value");
                 }
@@ -2962,9 +2993,14 @@ pub unsafe extern "C" fn SCRegisterSmbParser() {
         let retval = conf_get("app-layer.protocols.smb.max-read-queue-size");
         if let Some(val) = retval {
             match get_memval(val) {
-                Ok(retval) => {
-                    SMB_CFG_MAX_READ_QUEUE_SIZE = retval as u32;
-                }
+                Ok(retval) => match u32::try_from(retval) {
+                    Ok(v) => {
+                        SMB_CFG_MAX_READ_QUEUE_SIZE = v;
+                    }
+                    Err(_) => {
+                        SCLogError!("value out of range for smb.max-read-queue-size");
+                    }
+                },
                 Err(_) => {
                     SCLogError!("Invalid max-read-queue-size value");
                 }
@@ -2973,9 +3009,14 @@ pub unsafe extern "C" fn SCRegisterSmbParser() {
         let retval = conf_get("app-layer.protocols.smb.max-read-queue-cnt");
         if let Some(val) = retval {
             match get_memval(val) {
-                Ok(retval) => {
-                    SMB_CFG_MAX_READ_QUEUE_CNT = retval as u32;
-                }
+                Ok(retval) => match u32::try_from(retval) {
+                    Ok(v) => {
+                        SMB_CFG_MAX_READ_QUEUE_CNT = v;
+                    }
+                    Err(_) => {
+                        SCLogError!("value out of range for smb.max-read-queue-cnt");
+                    }
+                },
                 Err(_) => {
                     SCLogError!("Invalid max-read-queue-cnt value");
                 }
@@ -2983,7 +3024,12 @@ pub unsafe extern "C" fn SCRegisterSmbParser() {
         }
         if let Some(val) = conf_get("app-layer.protocols.smb.max-tx") {
             if let Ok(v) = val.parse::<usize>() {
-                SMB_MAX_TX = v;
+                // 0 would evict every transaction on insert
+                if v == 0 {
+                    SCLogError!("Invalid value for smb.max-tx");
+                } else {
+                    SMB_MAX_TX = v;
+                }
             } else {
                 SCLogError!("Invalid value for smb.max-tx");
             }

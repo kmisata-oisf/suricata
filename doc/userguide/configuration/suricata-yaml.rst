@@ -1566,6 +1566,22 @@ control messages only, not FTP data (file transfers).
       # Maximum line length for control messages before they will be truncated.
       #max-line-length: 4kb
 
+      # Maximum number of preliminary (1xx) responses kept per transaction.
+      #max-preliminary-responses: 16
+
+``memcap`` limits the memory that FTP counts for control-channel transactions,
+requests and replies, and for FTP-DATA file buffering. It defaults to 64 MiB
+and is shared by all FTP flows. Once it is reached, new FTP allocations fail:
+affected flows stop being parsed and file extraction can be truncated. A value
+of ``0`` removes the limit.
+
+A transaction keeps at most ``max-preliminary-responses`` preliminary
+(``1xx``) responses, 16 by default. Further preliminary responses for the same
+command are not stored or logged, and the
+``ftp.too_many_preliminary_responses`` event is raised on the transaction.
+``max-preliminary-responses`` must be greater than 0; an invalid value keeps
+the default.
+
 .. _suricata-yaml-configure-libhtp:
 
 Configure HTTP (libhtp)
@@ -1910,6 +1926,7 @@ order file data.
       enabled: yes
       max-read-size: 16mb
       max-write-size: 16mb
+      max-metadata-size: 16mb
 
       max-read-queue-size: 64mb
       max-read-queue-cnt: 64
@@ -1924,6 +1941,12 @@ much data. A value of 0 disables the checks.
 The `max-write-size` option can be set to control the max size of accepted
 WRITE request records. Events will be raised if a WRITE request claims too
 much data. A value of 0 disables the checks.
+
+The `max-metadata-size` option can be set to control how much of a partial
+NFSv3 LOOKUP, READDIRPLUS or CREATE reply may be buffered towards the size its
+RPC record claims, so the file handle to filename mapping is kept. A value of 0
+falls back to the default of 16mb: this limit cannot be disabled. It is
+separate from `max-read-size`, which only bounds READ data.
 
 For file tracking the parser queues up out of order file data per file
 transaction. To avoid using too much memory the parser allows for limiting
@@ -1968,7 +1991,7 @@ of analysis and the resource consumption.
 Its default value is 4096 bytes, but it can be set to any uint32 by a flow.
 
 `http2.max-streams` refers to `SETTINGS_MAX_CONCURRENT_STREAMS` from rfc 7540 section 6.5.2.
-Its default value is unlimited.
+Its default value is 256.
 
 SSL/TLS
 ~~~~~~~
@@ -2858,8 +2881,8 @@ use of.
     vista: []
     windows2k3: []
 
-Suricata as a Firewall options (experimental)
----------------------------------------------
+Suricata as a Firewall options
+------------------------------
 
 It is possible to run Suricata as a firewall.
 Please read :ref:`Firewall Mode Design <firewall mode design>` before using this.
@@ -3185,6 +3208,43 @@ default.
 Using this default setting, flows will be associated only if the compared packet
 headers are encapsulated in the same number of headers.
 
+.. _tunnels:
+
+Tunnels
+~~~~~~~
+
+If your packets sources are multiple tunnels encapsulating the traffic,
+you can configure the ``decoder.tunnels`` section to assign a tunnel
+identifier to each of these tunnels. Such tunnel traffic is
+unidirectional from a sender (like a switch doing traffic mirroring) to
+the ip address where Suricata is listening.
+
+.. note:: This setting is thus not meant for firewall nor IPS mode.
+
+These tunnel identifiers are used in flow hashing to be able to distinguish
+the same-looking flow (same 5-tuple) from different tunnels, meaning it
+is in fact a different subnetwork (like a VLAN identifier).
+
+Valid tunnel ids range from 1 to 32767.
+
+The supported tunnel types are:
+
+- vxlan
+- erspan2
+
+This section is a list of tunnels with the following parameters:
+::
+
+    - id: 1
+      type: erspan2 # or vxlan
+      src: 192.168.1.1
+      dst: 192.168.1.3 # ip address where suricata is receiving the traffic
+      session: 123 # erspan span id or vxlan vni
+
+Only IPv4 addresses are supported for now.
+
+These tunnel identifiers can be used for multi-tenancy.
+
 Advanced Options
 ----------------
 
@@ -3245,7 +3305,13 @@ Suricata 7.0 default:
        # Allow Lua rules. Enabled by default.
        #allow-rules: true
 
-       # Upper bound of allocations by a Lua rule before it will fail
+       # Upper bound of live memory a sandboxed Lua state may grow
+       # beyond its setup-time footprint (the loaded libs, the script
+       # chunk and the values thread_init() stored). Per-call working
+       # memory and memory the script retains between calls (module
+       # variables, upvalues, cached handles) count against it; the
+       # setup-time footprint and the call's own inputs (the inspected
+       # buffer and args) do not.
        #max-bytes: 500000 
 
        # Upper bound of lua instructions by a Lua rule before it will fail
